@@ -25,6 +25,11 @@ use windows::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 
+/**
+ * RELOCATION_BLOCKの定義と実装
+ * 具体的な操作は `RELOCATION_TABLE` を介して行われるため
+ * 本定義及び実装を直接用いることはない。
+ */
 #[allow(non_snake_case)]
 #[derive(Debug)]
 #[repr(C)]
@@ -32,23 +37,36 @@ pub struct BASE_RELOCATION_BLOCK {
     // リロケーション先のページアドレス
     pub page_address: u32,
     // リロケーションブロックのサイズ
-    pub block_size: u32,
+    pub rel_table_size: u32,
 }
-
 impl BASE_RELOCATION_BLOCK {
     /**
-     *  エントリの数を算出する
+     * エントリの数を算出する
+     * RELOCATION_BLOCKがメタデータの役割をしており、
+     * その直後にRELOCATION_ENTRYの配列が続く
+     * Cの構造体的に記述すると
+     * struct RELOCATION_TABLE{
+     *     RELOCATION_BLOCK block;
+     *     RELOCATION_ENTRY entry[block.rel_table_size - sizeof(RELOCATION_BLOCK)]
+     * }
+     * このような構造になっている（Cの構文的には誤りだがニュアンスとして記述した）
+     * 上記の構造体全体のサイズ(sizeof(RELOCATION_TABLE))が RELOCATION_BLOCK#rel_table_size に記述されている。
      */
     fn entry_count(&self) -> usize {
         // block_size: データ構造全体のバイト数（ヘッダ+エントリ総数）
         // EntryBytes=block_size-sizeof(BASE_RELOCATION_BLOCK): ヘッダを除くエントリの合計バイト数
         // EntryBytes / sizeof(BASE_RELOCATION_ENTRY): リロケーションエントリ数を算出します
         let entry_size_of_byte =
-            self.block_size as usize - std::mem::size_of::<BASE_RELOCATION_BLOCK>();
+            self.rel_table_size as usize - std::mem::size_of::<BASE_RELOCATION_BLOCK>();
         entry_size_of_byte / std::mem::size_of::<BASE_RELOCATION_ENTRY>()
     }
 }
 
+/**
+ * RELOCATION_ENTRYの定義と実装
+ * 各データがビットフィールドで実装されているため
+ * ビットシフト操作で抜き出すだけの実装となる。
+ */
 #[derive(Debug, Clone)]
 #[repr(C)]
 struct BASE_RELOCATION_ENTRY {
@@ -107,6 +125,9 @@ impl RELOCATION_TABLE {
             rel_block_offset: 0,
         }
     }
+    /**
+     * BASE_RELOCATION_BLOCKを返す
+     */
     fn get_relocation_block(&self) -> BASE_RELOCATION_BLOCK {
         unsafe {
             std::ptr::read::<BASE_RELOCATION_BLOCK>(
@@ -117,6 +138,15 @@ impl RELOCATION_TABLE {
             )
         }
     }
+    /**
+     * 生のポインタからリロケーションテーブルエントリのVecを作る
+     * 1. リロケーションテーブルのエントリ数: RELOCATION_BLOCK に書いてあるものを
+     * 　BASE_RELOCATION_BLOCK#entry_count();を使い、取得する。
+     * 2. self.rel_block_offset（ブロック内部のオフセット）を `RELOCATION_BLOCK分` 進める
+     * 3. std::slice::from_raw_parts::<BASE_RELOCATION_ENTRY>を使ってスライス化する
+     * 4. self.rel_block_offset（ブロック内部のオフセット）を `BASE_RELOCATION_ENTRY*エントリ数` 分進める
+     * 5. スライスをベクタにして返却する
+     */
     fn get_entries(&mut self) -> Vec<BASE_RELOCATION_ENTRY> {
         let block_header = self.get_relocation_block();
         self.rel_block_offset += std::mem::size_of::<BASE_RELOCATION_BLOCK>();
@@ -162,7 +192,7 @@ unsafe fn process_hollowing(src: impl Into<String>, dest: impl Into<String>) {
     // image_baseは再配置先のアドレスになる。
     let host_image_base = load_section(host_process, &pe, host_image_base, &source_binary);
 
-    // // ロードされたので再配置する
+    // ロードされたので再配置する
     do_relocation(host_process, &pe, host_image_base, &source_binary);
     // let optional_header = pe.header.optional_header.unwrap();
     proc_ctx.set_entry_point(host_entry_point);
@@ -335,14 +365,13 @@ unsafe fn do_relocation(
         if section.name().unwrap() == ".reloc" {
             println!("{}", section.name().unwrap());
             let reloc_addr = section.pointer_to_raw_data as usize;
-            let mut offset: usize = 0;
             let mut reloc =
                 RELOCATION_TABLE::new(source_binary.as_ptr() as *const c_void, reloc_addr);
             while reloc.get_table_offset() < rel.size as usize {
                 let block_header = reloc.get_relocation_block();
                 println!(
                     "Page: 0x{:X} block_size: {}",
-                    block_header.page_address, block_header.block_size
+                    block_header.page_address, block_header.rel_table_size
                 );
                 let block_entries = reloc.get_entries();
                 println!("entries: {}", block_entries.len());
