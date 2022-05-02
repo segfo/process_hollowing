@@ -1,26 +1,3 @@
-#[allow(non_snake_case)]
-#[derive(Debug)]
-#[repr(C)]
-pub struct BASE_RELOCATION_BLOCK {
-    pub PageAddress: u32,
-    pub BlockSize: u32,
-}
-
-#[derive(Debug)]
-#[repr(C)]
-struct BASE_RELOCATION_ENTRY {
-    entry: u16,
-}
-impl BASE_RELOCATION_ENTRY {
-    fn get_rva(&self) -> u16 {
-        self.entry & 0x0fff
-    }
-    // https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#base-relocation-types
-    fn get_type(&self) -> u16 {
-        (self.entry & 0xf000) >> 12
-    }
-}
-
 use goblin::pe::optional_header::OptionalHeader;
 use std::{
     any::Any,
@@ -47,6 +24,118 @@ use windows::{
     },
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+
+#[allow(non_snake_case)]
+#[derive(Debug)]
+#[repr(C)]
+pub struct BASE_RELOCATION_BLOCK {
+    // リロケーション先のページアドレス
+    pub page_address: u32,
+    // リロケーションブロックのサイズ
+    pub block_size: u32,
+}
+
+impl BASE_RELOCATION_BLOCK {
+    /**
+     *  エントリの数を算出する
+     */
+    fn entry_count(&self) -> usize {
+        // block_size: データ構造全体のバイト数（ヘッダ+エントリ総数）
+        // EntryBytes=block_size-sizeof(BASE_RELOCATION_BLOCK): ヘッダを除くエントリの合計バイト数
+        // EntryBytes / sizeof(BASE_RELOCATION_ENTRY): リロケーションエントリ数を算出します
+        let entry_size_of_byte =
+            self.block_size as usize - std::mem::size_of::<BASE_RELOCATION_BLOCK>();
+        entry_size_of_byte / std::mem::size_of::<BASE_RELOCATION_ENTRY>()
+    }
+}
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+struct BASE_RELOCATION_ENTRY {
+    entry: u16,
+}
+impl BASE_RELOCATION_ENTRY {
+    /**
+     * RVAを取得する。
+     * このRVAはBASE_RELOCATION_BLOCKのpage_addressと足し合わせることで利用できる形になる。
+     */
+    fn get_rva(&self) -> u16 {
+        self.entry & 0x0fff
+    }
+    /**
+     * タイプの取得する
+     * https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#base-relocation-types
+     */
+    fn get_type(&self) -> u16 {
+        (self.entry & 0xf000) >> 12
+    }
+}
+
+/**
+ * リロケーションテーブルを抽象的に読むための実装
+ * ----------- <-- pe_image_base
+ * | PE Image |  ^
+ * |          |  | reloc_section_base
+ * |          |  |
+ * |  .reloc  |  v  <-- pe_image_base + reloc_section_base
+ * | block1   |
+ * | b1_entry |
+ * | b1_entry |
+ * | b1_entry |
+ * | block2   | <-- rel_block_offset
+ * | b2_entry |
+ * | b2_entry |
+ * | b2_entry |
+ * | ...      |
+ * | blockN   |
+ */
+
+struct RELOCATION_TABLE {
+    // メモリ上に存在するPEイメージのベースアドレス
+    pe_image_base: *const c_void,
+    // メモリ上に存在するリロケーションセクション(.reloc)の
+    // PEイメージベースアドレスからのオフセット
+    reloc_section_base: usize,
+    // 今読んでいるリロケーションブロックのオフセット
+    rel_block_offset: usize,
+}
+impl RELOCATION_TABLE {
+    fn new(pe_image_base: *const c_void, reloc_section_base: usize) -> Self {
+        RELOCATION_TABLE {
+            pe_image_base: pe_image_base,
+            reloc_section_base: reloc_section_base,
+            rel_block_offset: 0,
+        }
+    }
+    fn get_relocation_block(&self) -> BASE_RELOCATION_BLOCK {
+        unsafe {
+            std::ptr::read::<BASE_RELOCATION_BLOCK>(
+                (self
+                    .pe_image_base
+                    .add(self.reloc_section_base + self.rel_block_offset) as usize)
+                    as *const _,
+            )
+        }
+    }
+    fn get_entries(&mut self) -> Vec<BASE_RELOCATION_ENTRY> {
+        let block_header = self.get_relocation_block();
+        self.rel_block_offset += std::mem::size_of::<BASE_RELOCATION_BLOCK>();
+        let entry_count = block_header.entry_count();
+        let block_entries = unsafe {
+            std::slice::from_raw_parts::<BASE_RELOCATION_ENTRY>(
+                self.pe_image_base
+                    .add(self.reloc_section_base + self.rel_block_offset)
+                    as *const _,
+                entry_count,
+            )
+        };
+        self.rel_block_offset += entry_count * std::mem::size_of::<BASE_RELOCATION_ENTRY>();
+        block_entries.to_vec()
+    }
+    fn get_table_offset(&self) -> usize {
+        self.rel_block_offset
+    }
+}
 
 // 正規プロセスを立ち上げる
 // 正規プロセスをくり抜く
@@ -247,36 +336,25 @@ unsafe fn do_relocation(
             println!("{}", section.name().unwrap());
             let reloc_addr = section.pointer_to_raw_data as usize;
             let mut offset: usize = 0;
-            while offset < rel.size as usize {
-                let block_header = std::ptr::read::<BASE_RELOCATION_BLOCK>(
-                    (source_binary.as_ptr().add(reloc_addr + offset) as usize) as *const _,
-                );
+            let mut reloc =
+                RELOCATION_TABLE::new(source_binary.as_ptr() as *const c_void, reloc_addr);
+            while reloc.get_table_offset() < rel.size as usize {
+                let block_header = reloc.get_relocation_block();
                 println!(
-                    "Page: 0x{:X} BlockSize: {}",
-                    block_header.PageAddress, block_header.BlockSize
+                    "Page: 0x{:X} block_size: {}",
+                    block_header.page_address, block_header.block_size
                 );
-                // BlockSize: データ構造全体のバイト数（ヘッダ+エントリ総数）
-                // EntryBytes=BlockSize-sizeof(BASE_RELOCATION_BLOCK): ヘッダを除くエントリの合計バイト数
-                // EntryBytes / sizeof(BASE_RELOCATION_ENTRY): リロケーションエントリ数を算出します
-                let entry_count = (block_header.BlockSize as usize
-                    - std::mem::size_of::<BASE_RELOCATION_BLOCK>())
-                    / std::mem::size_of::<BASE_RELOCATION_ENTRY>();
-                offset += std::mem::size_of::<BASE_RELOCATION_BLOCK>();
-                let block_entries = std::slice::from_raw_parts::<BASE_RELOCATION_ENTRY>(
-                    source_binary.as_ptr().add(reloc_addr + offset) as *const _,
-                    entry_count,
-                );
-                println!("entries: {}", entry_count);
+                let block_entries = reloc.get_entries();
+                println!("entries: {}", block_entries.len());
                 for entry in block_entries {
-                    offset += std::mem::size_of::<BASE_RELOCATION_ENTRY>();
                     // 0: IMAGE_REL_BASED_ABSOLUTE: 再配置不要
                     if entry.get_type() == 0 {
                         continue;
                     }
-                    let rel_rva = block_header.PageAddress + entry.get_rva() as u32;
+                    let rel_rva = block_header.page_address + entry.get_rva() as u32;
                     println!(
                         "rva: 0x{:X}  type: {}",
-                        block_header.PageAddress + entry.get_rva() as u32,
+                        block_header.page_address + entry.get_rva() as u32,
                         entry.get_type()
                     );
                     println!(
